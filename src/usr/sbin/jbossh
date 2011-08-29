@@ -1,0 +1,988 @@
+#!/usr/bin/python -ttO
+
+'''
+JBoss Shell - Centralised JBoss farm and cluster management
+
+TODO:
+- use JMX to push deployment when hot deployment is off
+- implement security, jboss user and group
+- add edit, export, clone capability
+- implement history in shell
+- log to /var/messages
+
+@author: graham@redhat.com
+
+'''
+
+from optparse import OptionParser
+import datetime
+import inspect
+import logging
+import re
+import subprocess
+import sys
+import time
+import yaml
+
+
+
+__CONST__RHEL = True
+__CONST__DEBUG = False
+__CONST__CONFIG_FILE = '/etc/jboss.yaml'
+__CONST__BOOT_LOG = 'startup.log'
+__CONST__IMAGES = '/var/lib/libvirt/images'
+__CONST__FUNCTION_REGEX = 'FUNC_GRP_..._(.*)'
+__CONST__SSH_OPTS = 'ssh -q -o BatchMode=yes -o strictHostKeyChecking=no -o ConnectTimeout=5 '
+__CONST__JBOSS_RUN_CONF = 'run.conf'
+__CONST__TOMCAT_RUN_CONF = 'setclasspath.sh'
+__CONST__TOMCAT_RUN_PROPS = 'catalina.properties'
+__CONST__POLL_SEC = 1
+__CONST__PORT_RANGE_END = 10
+__CONST__STOPPED = 0
+__CONST__STARTED = 1
+__CONST__STARTING = 2
+
+__CACHE_HOSTS = []
+
+def if_else(condition, true_value, false_value):
+    if condition:
+        return true_value
+    else:
+        return false_value
+
+def safe_string(string, prefix=None, suffix=None):
+    return if_else(string is None or string == '' or string == 'None', '', if_else(prefix is None, '', str(prefix)) + str(string) + if_else(suffix is None, '', str(suffix)))
+
+def getConfig(config, node, index1, index2=None, index3=None, to_string=True, fail_on_error=True, fall_to_template=True): 
+    config_value = None
+    if node is not None:            
+        try:
+            if index2 is None:
+                config_value = node[index1]
+            elif index3 is None:
+                config_value = node[index1][index2]
+            else:
+                config_value = node[index1][index2][index3]
+        except KeyError, TypeError:
+            if fall_to_template and config_value is None:
+                return getConfig(config, None, index1, index2, index3, to_string, fail_on_error);
+    else:
+        try:        
+            if index2 is None:
+                config_value = config['node_template'][index1]
+            elif index3 is None:
+                config_value = config['node_template'][index1][index2]
+            else:
+                config_value = config['node_template'][index1][index2][index3]                
+        except KeyError, TypeError:
+            if fail_on_error:
+                raise Exception('Incomplete configuration: could not find configuration attribute [' + index1 + ']' + safe_string(index2, ' [', ']') + safe_string(index3, ' [', ']') + ' on configuration node or template from file [' + __CONST__CONFIG_FILE + ']')
+    if to_string:
+        return str(config_value)
+    else:
+        return config_value
+
+def getPortVariables(port_range_start, prefix, variable_prefix, suffix):
+    ports = ''
+    for port in range(port_range_start, port_range_start + __CONST__PORT_RANGE_END):
+        ports = ports + prefix + variable_prefix + '.port' + str(port - port_range_start + 1) + '=' + str(port) + suffix
+    return ports
+
+def getNodeVariables(config, node, prefix, variable_prefix, suffix):
+    nodes = ''
+    nodes_number = 0
+    for node_list_node in config['node_list']:
+        if 'jboss' in getConfig(config, node_list_node, 'type', to_string=False) and getConfig(config, node_list_node, 'name') != getConfig(config, node, 'name') and getConfig(config, node_list_node, 'jboss', 'ip', fail_on_error=False) is not None:
+            nodes_number += 1;
+            nodes = nodes + prefix + variable_prefix + '.ip' + str(nodes_number) + '=' + getConfig(config, node_list_node, 'jboss', 'ip', fail_on_error=False) + suffix
+    return nodes
+
+def install(type, uri, product, profile, module, version, parent, config=None, options=None, node=None):
+    if type == 'yum_rpm':
+        run('/usr/bin/yum -y install ' + safe_string(product).replace('/', '-') + safe_string(profile, prefix='-').replace('/', '-') + safe_string(version, prefix='-').replace('/', '-'), config, options, node)
+    elif type == 'svn_exploded':
+        run('/bin/mkdir -p ' + safe_string(parent) + '; cd ' + safe_string(parent) + if_else(module == '', '/..', '') + '; /usr/bin/svn export --quiet --force ' + safe_string(uri, suffix='/') + safe_string(product, suffix='/') + safe_string(version, suffix='/') + safe_string(module), config, options, node)        
+    elif type == 'http_mvn':
+        run('/bin/mkdir -p ' + safe_string(parent) + '; cd ' + safe_string(parent) + '; /usr/bin/wget -q ' + safe_string(uri, suffix='/') + safe_string(product, suffix='/') + safe_string(profile, suffix='/') + safe_string(version, suffix='/') + safe_string(profile, suffix='-') + safe_string(version) + safe_string(module, prefix='.') , config, options, node)
+    elif type == 'http_web':
+        run('/bin/mkdir -p ' + safe_string(parent) + '; cd ' + safe_string(parent) + '; /usr/bin/wget -q ' + safe_string(uri, suffix='/') + safe_string(product, suffix='/') + safe_string(profile) + safe_string(version, prefix='-') + safe_string(module, prefix='.') , config, options, node)
+    elif type == 'lfs_exploded':
+        run('/bin/mkdir -p ' + safe_string(parent) + '; cd ' + safe_string(parent) + if_else(module == '', '/..', '') + '; /bin/cp -rf ' + safe_string(uri, suffix='/') + safe_string(product, suffix='/') + safe_string(version, suffix='/') + safe_string(module) + ' ./', config, options, node)        
+    elif type == 'lfs_packed':
+        run('/bin/mkdir -p ' + safe_string(parent) + '; cd ' + safe_string(parent) + '; /bin/cp -rf ' + safe_string(uri, suffix='/') + safe_string(product, suffix='/') + safe_string(profile) + safe_string(version, prefix='-') + safe_string(module, prefix='.') + ' ./', config, options, node)        
+    else:
+        raise Exception('unsupported install type [' + type + ']')
+
+def remove(type, uri, product, profile, module, version, parent, config=None, options=None, node=None):
+    if type == 'yum_rpm':
+        run('/usr/bin/yum -y remove ' + safe_string(product).replace('/', '-') + safe_string(profile, prefix='-').replace('/', '-') + safe_string(version, prefix='-').replace('/', '-'), config, options, node)
+        run('/bin/rm -rf ' + parent + '/*', config, options, node)
+    elif type == 'svn_exploded':
+        run('/bin/rm -rf ' + parent + '/*', config, options, node)
+    elif type == 'http_mvn':
+        run('/bin/rm -rf ' + parent + '/' + safe_string(profile, suffix='-') + safe_string(version) + safe_string(module, prefix='.') , config, options, node)
+    elif type == 'http_web':
+        run('/bin/rm -rf ' + parent + '/' + safe_string(profile) + safe_string(version, prefix='-') + safe_string(module, prefix='.') , config, options, node)
+    elif type == 'lfs_exploded':
+        run('/bin/rm -rf ' + parent + '/*', config, options, node)
+    elif type == 'lfs_packed':
+        run('/bin/rm -rf ' + parent + '/' + safe_string(profile) + safe_string(version, prefix='-') + safe_string(module, prefix='.'), config, options, node)
+    else:
+        raise Exception('unsupported remove type [' + type + ']')
+    run('/bin/mkdir -p ' + safe_string(parent) + '; DIRC=' + parent + '; while [ -d \$DIRC ] && [ \$(ls -1A \$DIRC | wc -l) -eq 0 ]; do DIRP=\$(/usr/bin/dirname \$DIRC); /bin/rmdir \$DIRC; DIRC=\$DIRP; done', config, options, node)
+
+def run(cmd, config=None, options=None, node=None, host=None, assert_access=True):
+    remote_cmd = config is not None and node is not None and options is not None and not options.local
+    if remote_cmd:
+        cmd = __CONST__SSH_OPTS + getConfig(config, node, 'host', 'user') + '@' + if_else(host, host, getConfig(config, node, 'host', 'name')) + ' "' + cmd + '"'
+    else:
+        cmd = 'eval "' + cmd + '"' 
+    start_time = datetime.datetime.now()
+    print_debug('about to execute [' + cmd + ']')
+    stdout, stderr = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE).communicate()
+    end_time = datetime.datetime.now() - start_time
+    print_debug('execution stdout [' + stdout.strip() + '] and stderr [' + stderr.strip() + '] in [' + str(end_time) + ']')
+    cmd_out = stdout.strip()
+    if assert_access and remote_cmd:
+        access_string = getConfig(config, node, 'host', 'user') + '@' + if_else(host, host, getConfig(config, node, 'host', 'name'))
+        if access_string not in __CACHE_HOSTS:
+            if  cmd_out == '':
+                start_time = datetime.datetime.now()
+                access_cmd = __CONST__SSH_OPTS + access_string + ' "/bin/echo Assert_Remote_Access"'
+                print_debug('about to execute [' + access_cmd + ']')
+                stdout, stderr = subprocess.Popen(access_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE).communicate()
+                end_time = datetime.datetime.now() - start_time
+                print_debug('execution stdout [' + stdout.strip() + '] and stderr [' + stderr.strip() + '] in [' + str(end_time) + ']')
+                if len(stdout.strip() + stderr.strip()) == 0:
+                    print_suffix('connection failed', type='failure')
+                    sys.exit()
+            __CACHE_HOSTS.append(access_string)
+            print_debug('asserted and cached access to [' + access_string + ']')        
+    return cmd_out
+        
+def print_debug(msg):
+    if __CONST__DEBUG:
+        sys.stdout.write('<debug>: ' + msg + '\r\n')
+
+def print_prefix(config, type, type_qualifier=None, msg=None, node=None):
+    if type_qualifier is None:
+        type_qualifier = 'DEFAULT..IP:PORT'
+    if __CONST__DEBUG:
+        sys.stdout.write('\r\n')
+    if node is not None:
+        sys.stdout.write(getConfig(config, node, 'name') + '@' + getConfig(config, node, 'host', 'name') + safe_string(type_qualifier, '[', ']') + ' ' + safe_string(type, suffix=' '))
+    if msg is not None and msg != '':
+        sys.stdout.write(msg)
+        sys.stdout.write(' ')
+    if __CONST__DEBUG:
+        sys.stdout.write('\r\n\r\n')
+    sys.stdout.flush()
+
+def print_prefix_jboss(config, msg=None, node=None):
+    print_prefix(config, 'jboss', getConfig(config, node, 'jboss', 'ip') + ':' + getConfig(config, node, 'jboss', 'port-jndi'), msg, node)
+
+def print_prefix_tomcat(config, msg=None, node=None):
+    print_prefix(config, 'tomcat', getConfig(config, node, 'tomcat', 'ip') + ':' + getConfig(config, node, 'tomcat', 'port-range-start'), msg, node)
+
+def print_prefix_jon_agent(config, msg=None, node=None):
+    print_prefix(config, 'jon agent', None, msg, node)
+
+def print_prefix_jon_server(config, msg=None, node=None):
+    print_prefix(config, 'jon server', None, msg, node)
+
+def print_prefix_httpd(config, msg=None, node=None):
+    print_prefix(config, 'httpd', None, msg, node)
+    
+def print_suffix(msg=None, type='success'):
+    if __CONST__DEBUG:
+        sys.stdout.write('\r\n')
+    if msg is not None and msg != '':
+        sys.stdout.write(msg)
+        sys.stdout.write(' ')
+    if type == 'success' or type == 'warning' or type == 'failure':
+        if __CONST__RHEL:
+            sys.stdout.write(subprocess.Popen('. /etc/init.d/functions; echo_' + type, shell=True, stdout=subprocess.PIPE).stdout.read())
+        else:
+            sys.stdout.write(' ... [' + type + ']')
+    sys.stdout.write('\n\r')
+    if __CONST__DEBUG:
+        sys.stdout.write('\r\n')
+    sys.stdout.flush()  
+
+def multihome_netdev(config, node, options, ip):
+    if len(run('/sbin/ip addr | /bin/grep ' + ip, config, options, node)) == 0:
+        run('/sbin/ip addr add ' + ip + '/32 dev ' + getConfig(config, node, 'host', 'netdev'), config, options, node)
+
+def load_config(config):
+    return yaml.load(file(config, 'r'))
+
+def get_function(name='.*', all=True):
+    functions = []
+    for object in globals():
+        function = getattr(sys.modules[__name__], object)    
+        function_name = get_function_name(object);
+        if inspect.isfunction(function) and function_name is not None and re.match(name, function_name):
+            functions.append(function)
+    if len(functions) != 1 and not all:
+        return [FUNC_GRP_AAA_help]
+    functions.sort(cmp_function)
+    return functions
+
+def cmp_function(a, b):
+    return cmp(a.__name__, b.__name__)
+
+def get_function_name(name):
+    match = re.match(__CONST__FUNCTION_REGEX, name)
+    if(match is not None):
+        return match.group(1)
+
+def parser_function(prog, name, description, options=False, paramaters=False):
+    parser = OptionParser(usage_function(prog, name, description, options, paramaters))
+    parser.add_option('-d', '--debug', action='store_true', dest='debug', default=False, help='print debug to stdout')
+    parser.add_option('-c', '--config', dest='config', help='overide default config file at [' + __CONST__CONFIG_FILE + '] with CONFIG')
+    parser.add_option('-l', '--local', action='store_true', dest='local', default=False, help='apply command to local nodes')
+    parser.add_option('-p', '--perhost', action='store_true', dest='perhost', default=False, help='apply command to unique hosts')
+    parser.add_option('-t', '--types', dest='types', help='apply command to nodes types listed in the TYPE csv')
+    parser.add_option('-g', '--tag', dest='tag', help='tag to apply to the farm operation')
+    parser.add_option('-n', '--nodes', dest='nodes', help='apply command to node names matching the NODES regex')
+    return parser
+
+def usage_function(prog, name, description='', options=False, paramaters=False):
+    return prog + ' ' + name + if_else(options, ' [options]', '') + if_else(paramaters, ' <parameters>', '') + if_else(description is '', '', '\n\nDescription: ' + description)
+
+def num_nodes_get(num_nodes, key):
+    try:
+        return num_nodes[key]
+    except KeyError:
+        return 0
+
+def num_nodes_inc(num_nodes, key):
+    try:
+        num_nodes[key] += 1
+    except KeyError:
+        num_nodes[key] = 1
+    return num_nodes[key]
+
+def num_nodes_sum(num_nodes):
+    sum = 0
+    for key in num_nodes.keys():
+        sum += num_nodes[key]
+    return sum
+
+def exec_function(parser, args, numargs, workers=None, summary=None):
+    (options, rargs) = parser.parse_args(args, None)
+    if len(rargs) < numargs + 1:
+        parser.error('requires further arguments')
+    if len(rargs) > numargs + 1:
+        parser.error('unrecognized extra arguments')
+    global __CONST__CONFIG_FILE
+    if options.config:
+        __CONST__CONFIG_FILE = options.config
+    config = load_config(__CONST__CONFIG_FILE)
+    global __CONST__DEBUG
+    if options.debug:
+        __CONST__DEBUG = True
+    valid_config = False
+    try:
+        if config != None and config['node_list'] is not None and len(config['node_list']) > 0 and config['node_template'] is not None:
+            valid_config = True
+    except KeyError:
+        pass
+    if not valid_config:
+        raise Exception('Incomplete configuration: could not find [node] list and or [template_node] node from file [' + __CONST__CONFIG_FILE + ']')    
+    num_nodes = {}
+    worker_return = 0
+    hosts = []
+    if workers is not None:
+        for worker_name in workers:
+            for node in config['node_list']:
+                if options.nodes is None or re.match(options.nodes, getConfig(config, node, 'name')):
+                    if not options.local or len(run('/usr/bin/nslookup ' + getConfig(config, node, 'host', 'name') + ' | /bin/grep $HOSTNAME')) > 0:
+                        if not options.perhost or not getConfig(config, node, 'host', 'name') in hosts:
+                            hosts.append(getConfig(config, node, 'host', 'name'))
+                            types = getConfig(config, node, 'type', to_string=False)
+                            if options.types:
+                                types = set(options.types.split(',')).intersection(set(getConfig(config, node, 'type', to_string=False)))
+                            if len(types) > 0:
+                                executed, worker_return_local = exec_function_worker(worker_name, config, options, rargs, node, num_nodes_get(num_nodes, worker_name))
+                                if executed:
+                                    num_nodes_inc(num_nodes, worker_name)
+                            for type in types:
+                                worker_name_type = worker_name + '_' + type
+                                executed, worker_return_local = exec_function_worker(worker_name_type, config, options, rargs, node, num_nodes_get(num_nodes, worker_name_type))
+                                if executed:
+                                    num_nodes_inc(num_nodes, worker_name_type)
+                                    worker_return += worker_return_local             
+        num_nodes_sum_int = num_nodes_sum(num_nodes)
+        if num_nodes_sum_int == 0:
+            print_suffix('no matching nodes found', 'failure')
+    if summary is not None and num_nodes_sum_int > 0:
+        summary(config, options, rargs, num_nodes_sum_int, worker_return)
+
+def exec_function_worker(worker_name, config, options, args, node, num_node):
+    try:
+        worker = getattr(sys.modules[__name__], worker_name)
+    except AttributeError:
+        return False, 0
+    else:                                
+        return True, worker(config, options, args, node, num_node)    
+
+def path_product_jboss(config, node):
+    return getConfig(config, node, 'host', 'home') + '/' + getConfig(config, node, 'jboss', 'product') + '/' + getConfig(config, node, 'jboss', 'version') + '/' + getConfig(config, node, 'jboss', 'module')
+
+def path_product_tomcat(config, node):
+    return getConfig(config, node, 'host', 'home') + '/' + getConfig(config, node, 'tomcat', 'product') + '/' + getConfig(config, node, 'tomcat', 'version') + '/' + getConfig(config, node, 'tomcat', 'module')
+
+def path_profile_jboss(config, node):
+    return path_product_jboss(config, node) + '/server/' + getConfig(config, node, 'jboss', 'profile')
+
+def path_profile_tomcat(config, node):
+    return path_product_tomcat(config, node) + '-' + getConfig(config, node, 'name')
+
+def path_profile_node_jboss(config, node):
+    return path_profile_jboss(config, node) + '/../' + getConfig(config, node, 'name')
+
+def path_product_jon_server(config, node):
+    product_jon_server = getConfig(config, node, 'host', 'home') + '/' + getConfig(config, node, 'jon_server', 'product') + '/' + getConfig(config, node, 'jon_server', 'version')
+    return 'RHQ_HOME=' + product_jon_server + ';export RHQ_SERVER_JAVA_HOME=' + getConfig(config, node, 'jon_server', 'jre') + '; ' + product_jon_server
+
+def status_host(config, options, args, node, num_node):
+    if len(run('/usr/bin/virsh list --all | /bin/grep ' + getConfig(config, node, 'host', 'name'), config, options, node, getConfig(config, node, 'host', 'hypervisor'))) > 0:
+        return __CONST__STARTED
+    return __CONST__STOPPED
+
+def status_proc_jboss(config, options, args, node, num_node):
+    if len(run('/bin/ps x | /bin/grep org.jboss.Main | /bin/grep ' + path_product_jboss(config, node) + ' | /bin/grep ' + getConfig(config, node, 'jboss', 'ip') + ' | /bin/grep ' + getConfig(config, node, 'name') + ' | /bin/grep -v Twiddle', config, options, node, assert_access=False)) > 0:
+        return __CONST__STARTED
+    return __CONST__STOPPED
+
+def status_procs_jboss(config, options, args, node, num_node):
+    if len(run('/bin/ps x | /bin/grep org.jboss.Main | /bin/grep ' + path_product_jboss(config, node) + ' | /bin/grep -v Twiddle', config, options, node)) > 0:
+        return __CONST__STARTED
+    return __CONST__STOPPED
+
+def status_jboss(config, options, args, node, num_node):
+    if status_proc_jboss(config, options, args, node, num_node) != __CONST__STOPPED:
+        if len(run(path_product_jboss(config, node) + '/bin/twiddle.sh -q -s jnp://' + getConfig(config, node, 'jboss', 'ip') + ':' + getConfig(config, node, 'jboss', 'port-jndi') + ' -u ' + getConfig(config, node, 'jboss', 'user') + ' -p ' + getConfig(config, node, 'jboss', 'password') + ' get jboss.system:type=Server Started | /bin/grep Started=true', config, options, node)) > 0:
+            return __CONST__STARTED
+        return __CONST__STARTING
+    return __CONST__STOPPED
+
+def status_tomcat(config, options, args, node, num_node):
+    if len(run('ps x | grep java | grep org.apache.catalina.startup.Bootstrap | grep ' + getConfig(config, node, 'tomcat', 'ip') + '| grep ' + getConfig(config, node, 'tomcat', 'version') + ' | grep -v ps', config, options, node, assert_access=False)) > 0:
+        return __CONST__STARTED
+    return __CONST__STOPPED
+
+def status_jon_agent(config, options, args, node, num_node):
+    if len(run('ps x | grep java | grep rhq.communications.connector.bind-address=' + getConfig(config, node, 'host', 'name') + ' | grep -v ps', config, options, node, assert_access=False)) > 0:
+        return __CONST__STARTED
+    return __CONST__STOPPED
+
+def status_jon_server(config, options, args, node, num_node): 
+    if len(run('ps x | grep java | grep app.name=rhq-server | grep ' + getConfig(config, node, 'jon_server', 'product') + ' | grep ' + getConfig(config, node, 'jon_server', 'version') + ' | grep -v ps', config, options, node, assert_access=False)) > 0:
+        return __CONST__STARTED
+    return __CONST__STOPPED
+
+def wait(config, options, args, node, num_node, wait_status):
+    while status_jboss(config, options, args, node, num_node) != wait_status:
+        time.sleep(__CONST__POLL_SEC)
+    return wait_status
+
+def FUNC_GRP_AAA_help(args):
+    if len(args) == 1 or len(args) != 2 or args[1] == '-h':
+        print usage_function('Usage: ' + sys.argv[0], '<command>', 'Centralised JBoss farm and cluster management\n', True, True)
+        print 'No command line arguments will initiate the interactive shell\n'
+        print 'Commands (unique prefix selects):\n'
+        for function in get_function():
+            print '  ' + get_function_name(function.__name__)
+        print usage_function('\nShell: ' + sys.argv[0], '')            
+        print usage_function('\nHelp: ' + sys.argv[0] + ' help', '<command>')
+        print ''
+    elif len(args) == 2:
+        get_function(args[1], False)[0](['-h'])   
+
+def FUNC_GRP_ZZZ_quit(args):
+    parser = parser_function(sys.argv[0], 'quit', 'Quit interactive shell')
+    exec_function(parser, args, 0)
+    raise KeyboardInterrupt 
+
+def FUNC_GRP_BAA_list(args) :  
+    parser = parser_function(sys.argv[0], 'list', 'List nodes', True)   
+    exec_function(parser, args, 0, ['list'], list_summary)
+
+def list_jboss(config, options, args, node, num_node, false_positive=False):
+    print_prefix_jboss(config, node=node)
+    node_status = status_jboss(config, options, args, node, num_node)
+    if node_status == __CONST__STARTED:
+        print_suffix('started')
+    elif node_status == __CONST__STARTING:
+        if false_positive:
+            print_suffix('starting')
+        else:
+            print_suffix('starting', 'warning')
+    else:
+        if false_positive:
+            print_suffix('shutdown')
+        else:
+            print_suffix('shutdown', 'warning')
+    return node_status
+
+def list_tomcat(config, options, args, node, num_node):
+    print_prefix_tomcat(config, node=node)
+    if status_tomcat(config, options, args, node, num_node) == __CONST__STARTED:
+        print_suffix('started')
+        return __CONST__STARTED
+    print_suffix('shutdown', 'warning')
+    return __CONST__STOPPED
+
+def list_jon_agent(config, options, args, node, num_node):
+    print_prefix_jon_agent(config, node=node)
+    if status_jon_agent(config, options, args, node, num_node) == __CONST__STARTED:
+        print_suffix('started')
+        return __CONST__STARTED
+    print_suffix('shutdown', 'warning')
+    return __CONST__STOPPED
+
+def list_jon_server(config, options, args, node, num_node):
+    print_prefix_jon_server(config, node=node)
+    if status_jon_server(config, options, args, node, num_node) == __CONST__STARTED:
+        print_suffix('started')
+        return __CONST__STARTED
+    print_suffix('shutdown', 'warning')
+    return __CONST__STOPPED
+
+def list_httpd(config, options, args, node, num_node):
+    print_prefix_httpd(config, node=node)
+    if len(run('service httpd status | grep running', config, options, node)) > 0:
+        print_suffix('started')
+        return __CONST__STARTED
+    print_suffix('shutdown', 'warning')
+    return __CONST__STOPPED
+
+def list_summary(config, options, args, num_nodes, worker_return): 
+    if worker_return == num_nodes * __CONST__STARTED:
+        print_suffix('Node regexp group started')
+    elif worker_return > __CONST__STOPPED:
+        print_suffix('Node regexp group partially started', 'warning')
+    else:
+        print_suffix('Node regexp group shutdown', 'warning')
+
+def FUNC_GRP_BBA_start(args):
+    parser = parser_function(sys.argv[0], 'start', 'Start nodes', True)    
+    exec_function(parser, args, 0, ['start', 'start_wait'], start_summary)
+    
+def start_jboss(config, options, args, node, num_node):
+    provision_jboss(config, options, args, node, num_node)
+    if list_jboss(config, options, args, node, num_node, True) == __CONST__STOPPED:    
+        print_prefix_jboss(config, 'issue start', node)
+        multihome_netdev(config, node, options, getConfig(config, node, 'jboss', 'ip'))
+        run('/bin/mkdir -p ' + path_profile_node_jboss(config, node) + '/log; RUN_CONF=' + path_product_jboss(config, node) + '/bin/' + __CONST__JBOSS_RUN_CONF + '; cd ' + path_product_jboss(config, node) + '/bin; /usr/bin/nohup ./run.sh -c ' + getConfig(config, node, 'jboss', 'profile') + '/../' + getConfig(config, node, 'name') + ' -b ' + getConfig(config, node, 'jboss', 'ip') + ' > ' + path_profile_node_jboss(config, node) + '/log/' + __CONST__BOOT_LOG + ' 2>&1 &', config, options, node)
+        print_suffix()
+        if num_node == 0:
+            start_wait_jboss_init(config, options, args, node, num_node)
+    return 0
+
+def start_tomcat(config, options, args, node, num_node):
+    provision_tomcat(config, options, args, node, num_node)
+    print_prefix_tomcat(config, node=node)
+    if status_tomcat(config, options, args, node, num_node) == __CONST__STOPPED:        
+        multihome_netdev(config, node, options, getConfig(config, node, 'tomcat', 'ip'))        
+        run('/bin/mkdir -p ' + path_profile_tomcat(config, node) + '/logs; JAVA_HOME=' + getConfig(config, node, 'tomcat', 'jre') + '; ' + path_profile_tomcat(config, node) + '/bin/startup.sh -Dtomcat.bind.address=' + getConfig(config, node, 'tomcat', 'ip') + ' > ' + path_profile_tomcat(config, node) + '/logs/' + __CONST__BOOT_LOG + ' 2>&1 &', config, options, node)
+    print_suffix('started')
+    return 0
+
+def start_wait_jboss_init(config, options, args, node, num_node):
+    print_prefix_jboss(config, 'init wait', node)  
+    start_wait_jboss(config, options, args, node, num_node)
+    print_suffix()
+    print_prefix_jboss(config, node=node)
+    print_suffix('started')
+
+def start_jon_agent(config, options, args, node, num_node):
+    provision_jon_agent(config, options, args, node, num_node)
+    print_prefix_jon_agent(config, node=node)
+    if status_jon_agent(config, options, args, node, num_node) != __CONST__STARTED:
+        jon_server = ''
+        for jon_server_node in config['node_list']:
+            if 'jon_server' in getConfig(config, jon_server_node, 'type', to_string=False):
+                if jon_server != '':
+                    jon_server += ', '
+                jon_server = getConfig(config, jon_server_node, 'host', 'name')
+        run('export RHQ_AGENT_JAVA_HOME=' + getConfig(config, node, 'jon_agent', 'jre') + '; export RHQ_AGENT_ADDITIONAL_JAVA_OPTS=\\\"-Drhq.agent.configuration-setup-flag=true -Drhq.agent.name=' + getConfig(config, node, 'host', 'name') + ' -Drhq.agent.plugins.availability-scan.period-secs=5 -Drhq.communications.connector.bind-address=' + getConfig(config, node, 'host', 'name') + ' -Drhq.agent.server.bind-address=' + jon_server + ' -Drhq.communications.connector.bind-port=16163 \\\"; nohup ' + getConfig(config, node, 'host', 'home') + '/' + getConfig(config, node, 'jon_agent', 'product') + '/' + getConfig(config, node, 'jon_agent', 'version') + '/bin/rhq-agent.sh -d  > /dev/null 2>&1 &', config, options, node)
+    print_suffix('started')
+    return 0
+
+def start_jon_server(config, options, args, node, num_node):
+    print_prefix_jon_server(config, node=node)
+    if status_jon_server(config, options, args, node, num_node) != __CONST__STARTED:
+        run(path_product_jon_server(config, node) + '/bin/rhq-server.sh start', config, options, node)
+        print_suffix('starting')
+    else:
+        print_suffix('started')
+    return 0
+
+def start_httpd(config, options, args, node, num_node):
+    print_prefix_httpd(config, node=node)
+    run('service httpd start', config, options, node)
+    print_suffix('started')
+    return 0
+
+def start_wait_jboss(config, options, args, node, num_node):
+    return wait(config, options, args, node, num_node, __CONST__STARTED)
+
+def start_wait(config, options, args, node, num_node):
+    if num_node == 0:
+        print_prefix(config, None, msg='Node regexp group')
+    return 0
+
+def start_summary(config, options, args, num_nodes, worker_return):
+    print_suffix('started')
+
+def FUNC_GRP_BCA_release(args):
+    parser = parser_function(sys.argv[0], 'release', 'Iterate over nodes, draining, provisioning, deploying and\nrefilling in serial order', True)
+    parser.add_option('-u', '--host', action='store_true', dest='host', default=False, help='include unprovisioning of host')
+    parser.add_option('-b', '--base', action='store_true', dest='base', default=False, help='include unprovisioning of node and base. The base is only unprovisioned if no other nodes are started who share this base.')
+    parser.add_option('-o', '--timeout', dest='timeout', default=30, help='Wait TIMEOUT min before node is considered drained and current sessions are killed')    
+    exec_function(parser, args, 0, ['release'], release_summary)
+
+def release_jboss(config, options, args, node, num_node):
+    drain_jboss(config, options, args, node, num_node);
+    if options.base:
+        unprovision_jboss(config, options, args, node, num_node);
+        provision_jboss(config, options, args, node, num_node)
+    else:
+        shutdown_jboss_wait(config, options, args, node, num_node)
+        deploy_jboss(config, options, args, node, num_node)
+    start_jboss(config, options, args, node, 1)
+    start_wait_jboss_init(config, options, args, node, num_node)
+    refill_jboss(config, options, args, node, num_node)
+    return 0
+
+def release_tomcat(config, options, args, node, num_node):
+    drain_tomcat(config, options, args, node, num_node);
+    if options.base:
+        unprovision_tomcat(config, options, args, node, num_node);
+        provision_tomcat(config, options, args, node, num_node)
+    else:
+        shutdown_tomcat(config, options, args, node, num_node)
+        deploy_tomcat(config, options, args, node, num_node)
+    start_tomcat(config, options, args, node, 1)
+    refill_tomcat(config, options, args, node, num_node)
+    return 0
+
+def release_summary(config, options, args, num_nodes, worker_return):
+    print_suffix('Node regexp group released')
+
+def FUNC_GRP_BDA_shutdown(args):
+    parser = parser_function(sys.argv[0], 'shutdown', 'Shutdown nodes cleanly', True)    
+    exec_function(parser, args, 0, ['shutdown', 'shutdown_wait'], shutdown_summary)
+
+def shutdown_jboss(config, options, args, node, num_node):
+    if list_jboss(config, options, args, node, num_node, True) == __CONST__STARTED:
+        print_prefix_jboss(config, 'issue shutdown', node)
+        run(path_product_jboss(config, node) + '/bin/shutdown.sh -s jnp://' + getConfig(config, node, 'jboss', 'ip') + ':' + getConfig(config, node, 'jboss', 'port-jndi') + ' -u ' + getConfig(config, node, 'jboss', 'user') + ' -p ' + getConfig(config, node, 'jboss', 'password'), config, options, node)
+        print_suffix()
+        return __CONST__STARTED
+    return __CONST__STOPPED
+
+def shutdown_tomcat(config, options, args, node, num_node):
+    destroy_tomcat(config, options, args, node, num_node)
+    return 0
+
+def shutdown_jboss_wait(config, options, args, node, num_node):
+    if shutdown_jboss(config, options, args, node, num_node) == __CONST__STARTED:
+        print_prefix_jboss(config, node=node)
+        wait(config, options, args, node, num_node, __CONST__STOPPED)
+        print_suffix('shutdown')
+
+def shutdown_jon_agent(config, options, args, node, num_node):
+    return destroy_jon_agent(config, options, args, node, num_node)
+
+def shutdown_jon_server(config, options, args, node, num_node):
+    print_prefix_jon_server(config, node=node)
+    if status_jon_server(config, options, args, node, num_node) == __CONST__STARTED:
+        run(path_product_jon_server(config, node) + '/bin/rhq-server.sh stop', config, options, node)
+    print_suffix('shutdown')
+    return 0
+
+def shutdown_httpd(config, options, args, node, num_node):
+    print_prefix_httpd(config, node=node)
+    run('service httpd stop', config, options, node)
+    print_suffix('shutdown')
+    return 0
+
+def shutdown_wait_jboss(config, options, args, node, num_node):
+    return wait(config, options, args, node, num_node, __CONST__STOPPED)
+
+def shutdown_wait(config, options, args, node, num_node):
+    if num_node == 0:
+        print_prefix(config, None, msg='Node regexp group')
+    return 0
+
+def shutdown_summary(config, options, args, num_nodes, worker_return):
+    print_suffix('shutdown')
+
+def FUNC_GRP_BEA_destroy(args):
+    parser = parser_function(sys.argv[0], 'destroy', 'Destroy nodes, ie kill', True)    
+    exec_function(parser, args, 0, ['destroy', 'destroy_wait'], destroy_summary)
+
+def destroy_jboss(config, options, args, node, num_node):
+    print_prefix_jboss(config, 'proc', node)
+    if status_proc_jboss(config, options, args, node, num_node) != __CONST__STOPPED:
+        print_suffix('detected')
+        print_prefix_jboss(config, 'issue destroy', node)
+        run('/bin/ps x | /bin/grep org.jboss.Main | /bin/grep ' + getConfig(config, node, 'jboss', 'ip') + ' | /bin/grep ' + getConfig(config, node, 'name') + ' | /bin/grep -v Twiddle | awk \'{print \$1}\' | tr -s \'\\n\' ' ' | xargs kill -9', config, options, node)
+        print_suffix()
+        return __CONST__STARTED
+    else:
+        print_suffix('not detected')
+    return __CONST__STOPPED
+
+def destroy_tomcat(config, options, args, node, num_node):
+    print_prefix_tomcat(config, node=node)
+    run('ps x | grep java | grep org.apache.catalina.startup.Bootstrap | grep ' + getConfig(config, node, 'tomcat', 'ip') + '| grep ' + getConfig(config, node, 'tomcat', 'version') + ' | grep -v ps | awk \'{print \$1}\' | tr -s \'\\n\' ' ' | xargs kill -9', config, options, node)
+    print_suffix('shutdown')
+    return __CONST__STOPPED
+
+def destroy_jon_agent(config, options, args, node, num_node):
+    print_prefix_jon_agent(config, node=node)
+    run('ps x | grep java | grep rhq.communications.connector.bind-address=' + getConfig(config, node, 'host', 'name') + ' | grep -v ps | awk \'{print \$1}\' | tr -s \'\\n\' \' \' | xargs kill -9 > /dev/null 2>&1', config, options, node, assert_access=False)
+    print_suffix('shutdown')
+    return 0
+
+def destroy_jon_server(config, options, args, node, num_node):
+    print_prefix_jon_server(config, node=node)
+    run(path_product_jon_server(config, node) + '/bin/rhq-server.sh kill', config, options, node)
+    print_suffix('shutdown')        
+    return 0
+
+def destroy_httpd(config, options, args, node, num_node):
+    return shutdown_httpd(config, options, args, node, num_node)
+
+def destroy_wait_jboss(config, options, args, node, num_node):
+    return wait(config, options, args, node, num_node, __CONST__STOPPED)
+
+def destroy_wait(config, options, args, node, num_node):
+    if num_node == 0:
+        print_prefix(config, None, msg='Node regexp group')
+    return 0
+
+def destroy_summary(config, options, args, num_nodes, worker_return):
+    print_suffix('shutdown')
+
+def FUNC_GRP_CAA_refill(args):
+    parser = parser_function(sys.argv[0], 'refill', 'Enable nodes to take on new sessions', True)
+    exec_function(parser, args, 0, ['refill'], refill_summary)
+
+def refill_generic(config, options, args, node, num_node):
+    for node_lb in config['node_list']:
+        if 'httpd' in getConfig(config, node_lb, 'type', to_string=False):
+            if 'httpd_modjk' in getConfig(config, node_lb, 'type', to_string=False):
+                run('curl -s \\\"http://' + getConfig(config, node_lb, 'host', 'name') + '/jkmanager/?cmd=update&from=list&w=loadbalancer&sw=' + getConfig(config, node, 'name') + '&vwa=0\\\"', config, options, node)
+            elif 'httpd_modcluster' in getConfig(config, node_lb, 'type', to_string=False):
+                run('curl -s \\\"http://' + getConfig(config, node_lb, 'host', 'name') + '/mod_cluster_manager?Cmd=ENABLE-APP&Range=NODE&JVMRoute=' + getConfig(config, node, 'name') + '\\\" > /dev/null 2>&1', config, options, node)
+
+def refill_jboss(config, options, args, node, num_node):
+    print_prefix_jboss(config, 'refilling', node)
+    refill_generic(config, options, args, node, num_node)
+    print_suffix()                
+    return 0
+
+def refill_tomcat(config, options, args, node, num_node):
+    print_prefix_tomcat(config, 'refilling', node)
+    refill_generic(config, options, args, node, num_node)
+    print_suffix()
+    return 0
+
+def refill_summary(config, options, args, num_nodes, worker_return):
+    print_prefix(config, None, msg='Node regexp group')
+    print_suffix('refilled')
+
+def FUNC_GRP_CBA_drain(args):
+    parser = parser_function(sys.argv[0], 'drain', 'Disable nodes ability to take on new sessions', True)
+    parser.add_option('-o', '--timeout', dest='timeout', default=30, help='Wait TIMEOUT min before node is considered drained and current sessions are killed')    
+    exec_function(parser, args, 0, ['drain'], drain_summary)
+
+def drain_generic(config, options, args, node, num_node): 
+    for node_lb in config['node_list']:
+        if 'httpd' in getConfig(config, node_lb, 'type', to_string=False):
+            if 'httpd_modjk' in getConfig(config, node_lb, 'type', to_string=False):
+                run('curl -s \\\"http://' + getConfig(config, node_lb, 'host', 'name') + '/jkmanager/?cmd=update&from=list&w=loadbalancer&sw=' + getConfig(config, node, 'name') + '&vwa=1\\\"', config, options, node)
+            elif 'httpd_modcluster' in getConfig(config, node_lb, 'type', to_string=False):
+                run('curl -s \\\"http://' + getConfig(config, node_lb, 'host', 'name') + '/mod_cluster_manager?Cmd=DISABLE-APP&Range=NODE&JVMRoute=' + getConfig(config, node, 'name') + '\\\"', config, options, node)
+            time.sleep(float(options.timeout) * 60)
+
+def drain_jboss(config, options, args, node, num_node):
+    print_prefix_jboss(config, 'draining', node)
+    drain_generic(config, options, args, node, num_node)
+    print_suffix()
+    return 0
+
+def drain_tomcat(config, options, args, node, num_node):
+    print_prefix_tomcat(config, 'draining', node)
+    drain_generic(config, options, args, node, num_node)
+    print_suffix()
+    return 0
+
+def drain_summary(config, options, args, num_nodes, worker_return):
+    print_prefix(config, None, msg='Node regexp group')
+    print_suffix('drained')
+
+def FUNC_GRP_DAA_deploy(args):
+    parser = parser_function(sys.argv[0], 'deploy', 'Deploy applications to nodes', True)    
+    exec_function(parser, args, 0, ['deploy'], deploy_summary)
+
+def deploy_jboss(config, options, args, node, num_node):
+    if getConfig(config, node, 'jboss', 'deploy', 'resource', to_string=False, fail_on_error=False) is not None:
+        for resource in getConfig(config, node, 'jboss', 'deploy', 'resource', to_string=False, fail_on_error=False):
+            print_prefix_jboss(config, 'deploy', node)
+            remove(getConfig(config, node, 'jboss', 'deploy', 'type'), getConfig(config, node, 'jboss', 'deploy', 'uri'), getConfig(config, resource, 'product', fall_to_template=False), getConfig(config, resource, 'profile', fall_to_template=False), getConfig(config, resource, 'module', fall_to_template=False), getConfig(config, resource, 'version', fall_to_template=False), path_profile_node_jboss(config, node) + '/' + getConfig(config, resource, 'deploy-dir', fall_to_template=False))
+            install(getConfig(config, node, 'jboss', 'deploy', 'type'), getConfig(config, node, 'jboss', 'deploy', 'uri'), getConfig(config, resource, 'product', fall_to_template=False), getConfig(config, resource, 'profile', fall_to_template=False), getConfig(config, resource, 'module', fall_to_template=False), getConfig(config, resource, 'version', fall_to_template=False), path_profile_node_jboss(config, node) + '/' + getConfig(config, resource, 'deploy-dir', fall_to_template=False))
+            print_suffix()
+    return 0
+
+def deploy_tomcat(config, options, args, node, num_node):
+    if getConfig(config, node, 'tomcat', 'deploy', 'resource', to_string=False, fail_on_error=False) is not None:
+        for resource in getConfig(config, node, 'tomcat', 'deploy', 'resource', to_string=False, fail_on_error=False):
+            print_prefix_tomcat(config, 'deploy', node)
+            remove(getConfig(config, node, 'tomcat', 'deploy', 'type'), getConfig(config, node, 'tomcat', 'deploy', 'uri'), getConfig(config, resource, 'product', fall_to_template=False), getConfig(config, resource, 'profile', fall_to_template=False), getConfig(config, resource, 'module', fall_to_template=False), getConfig(config, resource, 'version', fall_to_template=False), path_profile_tomcat(config, node) + '/' + getConfig(config, resource, 'deploy-dir', fall_to_template=False))
+            install(getConfig(config, node, 'tomcat', 'deploy', 'type'), getConfig(config, node, 'tomcat', 'deploy', 'uri'), getConfig(config, resource, 'product', fall_to_template=False), getConfig(config, resource, 'profile', fall_to_template=False), getConfig(config, resource, 'module', fall_to_template=False), getConfig(config, resource, 'version', fall_to_template=False), path_profile_tomcat(config, node) + '/' + getConfig(config, resource, 'deploy-dir', fall_to_template=False))
+            print_suffix()
+    return 0
+
+def deploy_summary(config, options, args, num_nodes, worker_return):
+    print_prefix(config, None, msg='Node regexp group')
+    print_suffix('deployed')
+
+def FUNC_GRP_DBA_undeploy(args):
+    parser = parser_function(sys.argv[0], 'undeploy', 'Undeploy applications to nodes', True)    
+    exec_function(parser, args, 0, ['undeploy'], undeploy_summary)
+
+def undeploy_jboss(config, options, args, node, num_node):
+    if getConfig(config, node, 'jboss', 'deploy', 'resource', to_string=False, fail_on_error=False) is not None:
+        for resource in getConfig(config, node, 'jboss', 'deploy', 'resource', to_string=False):
+            print_prefix_jboss(config, 'undeploy', node)
+            remove(getConfig(config, node, 'jboss', 'deploy', 'type'), getConfig(config, node, 'jboss', 'deploy', 'uri'), getConfig(config, resource, 'product', fall_to_template=False), getConfig(config, resource, 'profile', fall_to_template=False), getConfig(config, resource, 'module', fall_to_template=False), getConfig(config, resource, 'version', fall_to_template=False), path_profile_node_jboss(config, node) + '/' + getConfig(config, resource, 'deploy-dir', fall_to_template=False))
+            print_suffix()
+    return 0
+
+def undeploy_tomcat(config, options, args, node, num_node):
+    if getConfig(config, node, 'tomcat', 'deploy', 'resource', to_string=False, fail_on_error=False) is not None:
+        for resource in getConfig(config, node, 'tomcat', 'deploy', 'resource', to_string=False):
+            print_prefix_tomcat(config, 'undeploy', node)
+            remove(getConfig(config, node, 'tomcat', 'deploy', 'type'), getConfig(config, node, 'tomcat', 'deploy', 'uri'), getConfig(config, resource, 'product', fall_to_template=False), getConfig(config, resource, 'profile', fall_to_template=False), getConfig(config, resource, 'module', fall_to_template=False), getConfig(config, resource, 'version', fall_to_template=False), path_profile_tomcat(config, node) + '/' + getConfig(config, resource, 'deploy-dir', fall_to_template=False))
+            print_suffix()
+    return 0
+    
+def undeploy_summary(config, options, args, num_nodes, worker_return):
+    print_prefix(config, None, msg='Node regexp group')
+    print_suffix('undeployed')
+
+def FUNC_GRP_EAA_provision(args):
+    parser = parser_function(sys.argv[0], 'provision', 'Provision nodes', True)    
+    exec_function(parser, args, 0, ['provision'], provision_summary)
+
+def provision_host(config, options, args, node, num_node):
+    if status_host(config, options, args, node, num_node) == __CONST__STOPPED:
+        if len(run('/bin/echo -n test;', config, options, node, getConfig(config, node, 'host', 'hypervisor'))) > 0:
+            print_prefix(config, 'prov host', node=node)
+            run('/usr/sbin/virt-install -n ' + getConfig(config, node, 'host', 'name') + ' --mac=' + getConfig(config, node, 'host', 'mac') + ' -r ' + getConfig(config, node, 'host', 'memory') + ' --vcpus=' + getConfig(config, node, 'host', 'cpu') + ' --network=bridge:' + getConfig(config, node, 'host', 'network') + ' --disk path=' + __CONST__IMAGES + '/' + getConfig(config, node, 'host', 'name') + '.img,size=' + getConfig(config, node, 'host', 'disk') + ',bus=virtio,sparse=true --os-type=linux --os-variant=virtio26 --nographics --accelerate --noautoconsole --wait=-1 --location=' + getConfig(config, node, 'host', 'image') + ' -x \\\"ks=' + getConfig(config, node, 'host', 'kickstart') + ' noipv6 console=ttyS0\\\"; /usr/bin/virsh autostart ' + getConfig(config, node, 'host', 'name'), config, options, node, getConfig(config, node, 'host', 'hypervisor'))
+            print_suffix()
+            print_prefix(config, 'reboot host', node=node)
+            time.sleep(10)
+            run('/usr/bin/virsh start ' + getConfig(config, node, 'host', 'name'), config, options, node, getConfig(config, node, 'host', 'hypervisor'))
+            while len(run('/bin/echo test', config, options, node, assert_access=False)) == 0:
+                time.sleep(__CONST__POLL_SEC)
+            print_suffix()
+    return 0
+
+def provision_jboss(config, options, args, node, num_node):
+    provision_status = run('/bin/echo -n test; [ -a ' + path_profile_jboss(config, node) + ' ] && /bin/echo -n ' + getConfig(config, node, 'jboss', 'product') + ' && [ -a ' + path_profile_node_jboss(config, node) + ' ] && /bin/echo -n ' + getConfig(config, node, 'name'), config, options, node, assert_access=False)
+    if len(provision_status) == 0:
+        provision_host(config, options, args, node, num_node)
+        provision_status = run('/bin/echo -n test; [ -a ' + path_profile_jboss(config, node) + ' ] && /bin/echo -n ' + getConfig(config, node, 'jboss', 'product') + ' && [ -a ' + path_profile_node_jboss(config, node) + ' ] && /bin/echo -n ' + getConfig(config, node, 'name'), config, options, node, assert_access=False)
+    if provision_status.find(getConfig(config, node, 'jboss', 'product')) == -1:
+        print_prefix_jboss(config, 'prov base', node)
+        install(getConfig(config, node, 'repository', 'type'), getConfig(config, node, 'repository', 'uri'), getConfig(config, node, 'jboss', 'product'), 'server/' + getConfig(config, node, 'jboss', 'profile'), getConfig(config, node, 'jboss', 'module'), getConfig(config, node, 'jboss', 'version'), getConfig(config, node, 'host', 'home') + '/' + getConfig(config, node, 'jboss', 'product') + '/' + getConfig(config, node, 'jboss', 'version'), config, options, node)
+        print_suffix()
+    if provision_status.find(getConfig(config, node, 'name')) == -1:
+        print_prefix_jboss(config, 'prov node', node)
+        partition_tag = ''
+        if options.tag is not None:
+            partition_tag = '_' + options.tag
+        run('/bin/cp -rf ' + path_profile_jboss(config, node) + ' ' + path_profile_node_jboss(config, node), config, options, node)
+        run('/bin/touch ' + path_profile_node_jboss(config, node) + '/' + __CONST__JBOSS_RUN_CONF + '; /bin/echo -e \\\"\n\n# jbosss node definition variables, added by jbossh\nJAVA_OPTS=\\\\\\"\\\\\$JAVA_OPTS -Djboss.bind.address=' + getConfig(config, node, 'jboss', 'ip') + ' -Djboss.service.binding.set=' + getConfig(config, node, 'jboss', 'port-bindings-set') + ' -Djboss.port.jndi=' + getConfig(config, node, 'jboss', 'port-jndi') + ' -Djboss.node.name=' + getConfig(config, node, 'name') + ' -Djboss.node.id=' + getConfig(config, node, 'id') + ' -Djboss.messaging.ServerPeerID=' + getConfig(config, node, 'id') + ' -Djboss.jvm.route=' + getConfig(config, node, 'name') + ' -Djboss.partition.name=' + getConfig(config, node, 'jboss', 'partition') + partition_tag + ' -Djboss.partition.udpGroup=' + getConfig(config, node, 'jboss', 'mcast-ip') + ' -Dcom.sun.management.jmxremote.ssl=false -Dcom.sun.management.jmxremote.authenticate=false -Djboss.platform.mbeanserver -Djavax.management.builder.initial=org.jboss.system.server.jmx.MBeanServerBuilderImpl -Dcom.sun.management.jmxremote.port=' + str(__CONST__PORT_RANGE_END + getConfig(config, node, 'jboss', 'port-range-start', to_string=False)) + getPortVariables(getConfig(config, node, 'jboss', 'port-range-start', to_string=False), ' -D', 'jboss.bind', '') + getNodeVariables(config, node, ' -D', 'jboss.node', '') + '\\\\\\"\nJAVA_HOME=' + getConfig(config, node, 'jboss', 'jre') + '\\\" >> ' + path_profile_node_jboss(config, node) + '/' + __CONST__JBOSS_RUN_CONF, config, options, node)
+        print_suffix()
+        deploy_jboss(config, options, args, node, num_node)
+    return 0
+
+def provision_tomcat(config, options, args, node, num_node):
+    provision_status = run('/bin/echo -n test; [ -a ' + path_product_tomcat(config, node) + ' ] && /bin/echo -n ' + getConfig(config, node, 'tomcat', 'product') + ' && [ -a ' + path_profile_tomcat(config, node) + ' ] && /bin/echo -n ' + getConfig(config, node, 'name'), config, options, node, assert_access=False)
+    if len(provision_status) == 0:
+        provision_host(config, options, args, node, num_node)
+        provision_status = run('/bin/echo -n test; [ -a ' + path_product_tomcat(config, node) + ' ] && /bin/echo -n ' + getConfig(config, node, 'tomcat', 'product') + ' && [ -a ' + path_profile_tomcat(config, node) + ' ] && /bin/echo -n ' + getConfig(config, node, 'name'), config, options, node, assert_access=False)
+    if provision_status.find(getConfig(config, node, 'tomcat', 'product')) == -1:
+        print_prefix_tomcat(config, 'prov base', node)
+        install(getConfig(config, node, 'repository', 'type'), getConfig(config, node, 'repository', 'uri'), getConfig(config, node, 'tomcat', 'product'), getConfig(config, node, 'tomcat', 'module'), getConfig(config, node, 'tomcat', 'module'), getConfig(config, node, 'tomcat', 'version'), getConfig(config, node, 'host', 'home') + '/' + getConfig(config, node, 'tomcat', 'product') + '/' + getConfig(config, node, 'tomcat', 'version'), config, options, node)
+        print_suffix()
+    if provision_status.find(getConfig(config, node, 'name')) == -1:
+        print_prefix_tomcat(config, 'prov node', node)
+        run('/bin/cp -rf ' + path_product_tomcat(config, node) + ' ' + path_profile_tomcat(config, node), config, options, node)
+        run('/bin/touch ' + path_profile_tomcat(config, node) + '/conf/' + __CONST__TOMCAT_RUN_PROPS + '; /bin/echo -e \\\"\n\n# tomcat node definition variables, added by jbossh\ntomcat.bind.address=' + getConfig(config, node, 'tomcat', 'ip') + '\n' + getPortVariables(getConfig(config, node, 'tomcat', 'port-range-start', to_string=False), '', 'tomcat.bind', '\n') + '\\\" >> ' + path_profile_tomcat(config, node) + '/conf/' + __CONST__TOMCAT_RUN_PROPS, config, options, node)
+        run('/bin/touch ' + path_profile_tomcat(config, node) + '/bin/' + __CONST__TOMCAT_RUN_CONF + '; /bin/echo -e \\\"\n\n# tomcat node definition variables, added by jbossh\nJAVA_OPTS=\\\\\\"\\\\\$JAVA_OPTS -Dcom.sun.management.jmxremote.port=' + str(__CONST__PORT_RANGE_END + getConfig(config, node, 'tomcat', 'port-range-start', to_string=False)) + '\\\\\\"\n\\\" >> ' + path_profile_tomcat(config, node) + '/bin/' + __CONST__TOMCAT_RUN_CONF, config, options, node)
+        print_suffix()
+        deploy_tomcat(config, options, args, node, num_node)
+    return 0
+
+def provision_jon_agent(config, options, args, node, num_node):
+    provision_status = run('/bin/echo -n test; [ -a ' + getConfig(config, node, 'host', 'home') + '/' + getConfig(config, node, 'jon_agent', 'product') + '/' + getConfig(config, node, 'jon_agent', 'version') + ' ] && /bin/echo -n ' + getConfig(config, node, 'jon_agent', 'product'), config, options, node, assert_access=False)
+    if len(provision_status) == 0:
+        provision_host(config, options, args, node, num_node)
+    if provision_status.find(getConfig(config, node, 'jon_agent', 'product')) == -1:
+        print_prefix_jon_agent(config, 'prov', node)
+        install(getConfig(config, node, 'repository', 'type'), getConfig(config, node, 'repository', 'uri'), getConfig(config, node, 'jon_agent', 'product'), '', '', getConfig(config, node, 'jon_agent', 'version'), getConfig(config, node, 'host', 'home') + '/' + getConfig(config, node, 'jon_agent', 'product') + '/' + getConfig(config, node, 'jon_agent', 'version'), config, options, node)
+        print_suffix()
+    return 0
+
+def provision_jon_server(config, options, args, node, num_node):
+    provision_status = run('/bin/echo -n test; [ -a ' + getConfig(config, node, 'host', 'home') + '/' + getConfig(config, node, 'jon_server', 'product') + '/' + getConfig(config, node, 'jon_server', 'version') + ' ] && /bin/echo -n ' + getConfig(config, node, 'jon_server', 'product'), config, options, node, assert_access=False)
+    if len(provision_status) == 0:
+        provision_host(config, options, args, node, num_node)
+    if provision_status.find(getConfig(config, node, 'jon_server', 'product')) == -1:
+        print_prefix_jon_agent(config, 'prov', node)
+        install(getConfig(config, node, 'repository', 'type'), getConfig(config, node, 'repository', 'uri'), getConfig(config, node, 'jon_server', 'product'), '', '', getConfig(config, node, 'jon_server', 'version'), getConfig(config, node, 'host', 'home') + '/' + getConfig(config, node, 'jon_server', 'product') + '/' + getConfig(config, node, 'jon_server', 'version'), config, options, node)
+        print_suffix()
+    return 0
+
+def provision_summary(config, options, args, num_nodes, worker_return):
+    print_suffix('Node regexp provisioned')
+
+def FUNC_GRP_EBA_unprovision(args):
+    parser = parser_function(sys.argv[0], 'unprovision', 'Unprovision nodes', True)    
+    parser.add_option('-u', '--host', action='store_true', dest='host', default=False, help='include unprovisioning of host') 
+    exec_function(parser, args, 0, ['unprovision', 'unprovision_host'], unprovision_summary)
+
+def unprovision_host(config, options, args, node, num_node):
+    if options.host:
+        print_prefix(config, 'unprov host', node=node)
+        run('/usr/bin/virsh destroy ' + getConfig(config, node, 'host', 'name') + '; /usr/bin/virsh undefine ' + getConfig(config, node, 'host', 'name') + '; /usr/bin/virsh vol-delete ' + __CONST__IMAGES + '/' + getConfig(config, node, 'host', 'name') + '.img; /bin/grep -Hl ' + getConfig(config, node, 'host', 'name') + '.*.img /etc/sysconfig/rhn/virt/*.xml| xargs rm -rf', config, options, node, getConfig(config, node, 'host', 'hypervisor'))
+        print_suffix()
+    return 0
+        
+def unprovision_jboss(config, options, args, node, num_node):
+    shutdown_jboss_wait(config, options, args, node, num_node)
+    if not options.host:
+        print_prefix_jboss(config, 'unprov node profile', node)
+        run('/bin/rm -rf ' + path_profile_node_jboss(config, node), config, options, node)
+        print_suffix()
+        print_prefix_jboss(config, 'peer procs', node)
+        if status_procs_jboss(config, options, args, node, num_node) == __CONST__STARTED:
+            print_suffix('detected')
+        else:
+            print_suffix('not detected')
+            print_prefix_jboss(config, 'unprov base', node)
+            remove(getConfig(config, node, 'repository', 'type'), getConfig(config, node, 'repository', 'uri'), getConfig(config, node, 'jboss', 'product'), 'server/' + getConfig(config, node, 'jboss', 'profile'), getConfig(config, node, 'jboss', 'module'), getConfig(config, node, 'jboss', 'version'), getConfig(config, node, 'host', 'home') + '/' + getConfig(config, node, 'jboss', 'product') + '/' + getConfig(config, node, 'jboss', 'version'), config, options, node)
+            print_suffix()
+    return 0
+
+def unprovision_tomcat(config, options, args, node, num_node):
+    shutdown_tomcat(config, options, args, node, num_node)
+    if not options.host:
+        print_prefix_tomcat(config, 'unprov node profile', node)
+        run('/bin/rm -rf ' + path_profile_tomcat(config, node), config, options, node)
+        print_suffix()
+        print_prefix_tomcat(config, 'unprov base', node)
+        remove(getConfig(config, node, 'repository', 'type'), getConfig(config, node, 'repository', 'uri'), getConfig(config, node, 'tomcat', 'product'), getConfig(config, node, 'tomcat', 'module'), getConfig(config, node, 'tomcat', 'module'), getConfig(config, node, 'tomcat', 'version'), getConfig(config, node, 'host', 'home') + '/' + getConfig(config, node, 'tomcat', 'product') + '/' + getConfig(config, node, 'tomcat', 'version'), config, options, node)
+        print_suffix()
+    return 0
+
+def unprovision_jon_agent(config, options, args, node, num_node):
+    shutdown_jon_agent(config, options, args, node, num_node)
+    if not options.host:
+        print_prefix_jon_agent(config, 'unprov', node)
+        remove(getConfig(config, node, 'repository', 'type'), getConfig(config, node, 'repository', 'uri'), getConfig(config, node, 'jon_agent', 'product'), '', '', getConfig(config, node, 'jon_agent', 'version'), getConfig(config, node, 'host', 'home') + '/' + getConfig(config, node, 'jon_agent', 'product') + '/' + getConfig(config, node, 'jon_agent', 'version'), config, options, node)
+        print_suffix()
+    return 0
+
+def unprovision_summary(config, options, args, num_nodes, worker_return):
+    print_suffix('Node regexp unprovisioned')
+
+def FUNC_GRP_YAA_command(args):
+    parser = parser_function(sys.argv[0], 'command <command>', 'Execute shell command on node hosts', True)
+    exec_function(parser, args, 1, ['command'], command_summary)
+
+def command(config, options, args, node, num_node):
+    print_prefix(config, '', '', 'run command', node)
+    output = run(args[1], config, options, node)
+    print_suffix()
+    print output
+    return 0
+    
+def command_summary(config, options, args, num_nodes, worker_return):
+    print_suffix('Node regexp command executed')
+
+def FUNC_GRP_YAB_twiddle(args):
+    parser = parser_function(sys.argv[0], 'twiddle <command>', 'Execute twiddle command on jboss nodes', True)
+    exec_function(parser, args, 1, ['twiddle'], twiddle_summary)
+
+def twiddle_jboss(config, options, args, node, num_node):
+    print_prefix_jboss(config, 'run twiddle', node)
+    if status_jboss(config, options, args, node, num_node) == __CONST__STARTED:
+        output = run(path_product_jboss(config, node) + '/bin/twiddle.sh -s jnp://' + getConfig(config, node, 'jboss', 'ip') + ':1099 -u ' + getConfig(config, node, 'jboss', 'user') + ' -p ' + getConfig(config, node, 'jboss', 'password') + ' ' + args[1], config, options, node)
+        print_suffix()
+        print output
+    else:
+        print_suffix(type='failure')
+        print '<!-- jboss not running -->'
+    return 0
+
+def twiddle_summary(config, options, args, num_nodes, worker_return):
+    print_suffix('Node regexp twiddle executed')
+
+def FUNC_GRP_YAC_test(args):
+    parser = parser_function(sys.argv[0], 'test', 'Test connection to hosts named as nodes')
+    exec_function(parser, args, 0, ['test'], test_summary)
+    
+def test(config, options, args, node, num_node):
+    print_prefix(config, '', '', 'testing connection', node)
+    if len(run('/bin/echo Assert_Remote_Access', config, options, node, assert_access=False)) > 0:
+        print_suffix()
+        return 1
+    print_suffix(type='failure')
+    return 0
+    
+def test_summary(config, options, args, num_nodes, worker_return):
+    print_suffix('Node regexp host connection test executed')
+
+def shell():
+    sys.stdout.write('%s # ' % sys.argv[0])
+    sys.stdout.flush()
+    command = sys.stdin.readline();
+    if command == '':
+        raise KeyboardInterrupt
+    get_function(command.strip().split(' ')[0], False)[0](command.strip().split(' '))
+
+def main() :
+    if len(sys.argv) == 1:
+        while 1:
+            try:
+                shell()
+            except SystemExit:
+                pass
+            except KeyboardInterrupt:
+                print ' ... bye'
+                sys.exit(0)
+    else:
+        get_function(sys.argv[1], False)[0](sys.argv[1:])
+
+if __name__ == '__main__':
+    try: 
+        main()
+    except SystemExit, sys_e:
+        sys.exit(sys_e.code)
+    except KeyboardInterrupt:
+        sys.exit(1)
+    except Exception, main_e:
+        logging.exception(main_e)
+        sys.exit(2) 
+

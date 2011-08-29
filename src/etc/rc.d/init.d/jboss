@@ -1,0 +1,30 @@
+#!/bin/sh
+
+###############################################################################
+#
+# jboss
+# chkconfig: - 80 20
+# description: Manage local jboss nodes
+#
+###############################################################################
+
+JBOSSH=/usr/sbin/jbossh
+
+case "$1" in
+  start)
+        $JBOSSH start --local --type jboss
+        ;;
+  stop)
+        $JBOSSH shutdown --local --type jboss
+        ;;
+  kill)
+        $JBOSSH destroy --local --type jboss
+        ;;
+  status)
+        $JBOSSH list --local --type jboss
+        ;;
+  *)
+        echo $"Usage: $0 {start|stop|kill|status}"
+        exit 1
+esac
+ 

@@ -1,0 +1,77 @@
+##########################################################################
+#
+# JBoss Farm Configuration 
+#
+##########################################################################
+
+---
+
+##########################################################################
+#
+# Node template
+#
+##########################################################################
+node_template:
+  id: UNIQUE_ID
+  name: LOGICAL_NAME
+  jboss:
+    product: jboss-enterprise/ap
+    module: jboss-as
+    profile: custom/farm/base
+    version: 5.0.1
+    user: admin
+    password: admin
+    ip: BIND_IP
+    port-jndi: 1099
+    port-range-start: 9000
+    port-bindings-set: ports-default
+    partition: A
+    mcast-ip: 239.255.100.100
+    jre: /home/ggear/opt/java/jdk1.6.0_20
+    deploy:
+      type: lfs_packed
+      uri: /home/ggear/opt/jboss/trunk/jboss-apps
+      resource:
+        - product: jboss-clusterinfo/clusterinfo-ear/target
+          profile: clusterinfo-ear
+          module: ear
+          version: 0.0.3
+          deploy-dir: deploy
+  jon_agent:
+    product: jboss-enterprise/on/agent
+    version: 2.4.0.GA
+    jre: /home/ggear/opt/java/jdk1.6.0_20
+  jon_server:
+    product: jboss-enterprise/on/server
+    version: 2.4.0.GA
+    jre: /home/ggear/opt/java/jdk1.6.0_20
+  repository:  
+    type: lfs_exploded 
+    uri: /home/ggear/opt/jboss/trunk
+  host: 
+    name: ggear.london
+    mac: 00:16:3e:65:be:41
+    user: root
+    home: /opt
+    netdev: eth0  
+    cpu: 4
+    memory: 3072
+    disk: 4
+    network: br0
+    hypervisor: caneland2
+    image: http://bl685c-01.saleslab.fab.redhat.com/ks/dist/ks-rhel-x86_64-server-5-u5
+    kickstart: http://bl685c-01.saleslab.fab.redhat.com/ks/cfg/label/ggear_coe-jbossep-64
+  type: [jboss, jon_agent]
+
+##########################################################################
+#
+# Node list
+#
+##########################################################################
+node_list:
+
+  - id: 1
+    name: node01
+    jboss:
+      ip: 127.0.0.1
+    type: [jboss, jon_server, jon_agent, httpd, httpd_modcluster]

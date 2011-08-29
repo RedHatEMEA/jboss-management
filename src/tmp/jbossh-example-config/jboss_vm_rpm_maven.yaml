@@ -1,0 +1,141 @@
+##########################################################################
+#
+# JBoss Farm Configuration 
+#
+##########################################################################
+
+---
+
+##########################################################################
+#
+# Node template
+#
+##########################################################################
+node_template:
+  id: UNIQUE_ID
+  name: LOGICAL_NAME
+  jboss:
+    product: jboss-enterprise/ap
+    module: jboss-as
+    profile: custom/farm/base
+    version: 5.1.0/4
+    user: admin
+    password: admin
+    ip: BIND_IP
+    port-jndi: 1099
+    port-range-start: 9000
+    port-bindings-set: ports-default
+    partition: A
+    mcast-ip: 239.255.100.100
+    jre: /usr/lib/jvm/java-1.6.0-openjdk-1.6.0.0.x86_64/jre
+    deploy:
+      type: http_mvn
+      uri: http://caneland2.saleslab.fab.redhat.com:8081/nexus/content/repositories/thirdparty  
+      resource:
+        - product: org/jboss/poc/clusterinfo
+          profile: clusterinfo-ear
+          module: ear
+          version: 0.0.3
+          deploy-dir: deploy
+  jon_agent:
+    product: jboss-enterprise/on/agent
+    version: 2.4.0.GA/2
+    jre: /usr/lib/jvm/java-1.6.0-openjdk-1.6.0.0.x86_64/jre
+  jon_server:
+    product: jboss-enterprise/on/server
+    version: 2.4.0.GA/2
+    jre: /usr/lib/jvm/java-1.6.0-openjdk-1.6.0.0.x86_64/jre
+  repository:  
+    type: yum_rpm 
+    uri: 
+  host: 
+    name: HOST_NAME
+    mac: HOST_MAC_ADDRESS
+    user: root
+    home: /opt
+    netdev: eth0  
+    cpu: 4
+    memory: 3072
+    disk: 4
+    network: br0
+    hypervisor: caneland2
+    image: http://bl685c-01.saleslab.fab.redhat.com/ks/dist/ks-rhel-x86_64-server-5-u5
+    kickstart: http://bl685c-01.saleslab.fab.redhat.com/ks/cfg/label/ggear_coe-jbossep-64
+  type: [jboss, jon_agent]
+
+##########################################################################
+#
+# Node list
+#
+##########################################################################
+node_list:
+
+  - id: 0
+    name: ldbl01
+    host:
+      name: coe2
+      mac: 00:16:3e:65:be:41
+      disk: 20
+      kickstart: http://bl685c-01.saleslab.fab.redhat.com/ks/cfg/label/ggear_coe-jboss-on-lb-64
+    type: [jon_server, jon_agent, httpd, httpd_modcluster]
+
+  - id: 1
+    name: prod01
+    jboss:
+      ip: 10.33.11.60
+      port-range-start: 9000      
+    host:
+      name: coe3
+      mac: 00:16:3e:65:be:42
+    type: [jboss, jon_agent]
+
+  - id: 2
+    name: prod02
+    jboss:
+      ip: 10.33.11.61
+      port-range-start: 9100
+    host:
+      name: coe3
+      mac: 00:16:3e:65:be:42
+    type: [jboss, jon_agent]
+
+  - id: 3
+    name: prod03
+    jboss:
+      ip: 10.33.11.62
+      port-range-start: 9000      
+    host:
+      name: coe4
+      mac: 00:16:3e:65:be:43
+    type: [jboss, jon_agent]
+
+  - id: 4
+    name: prod04
+    jboss:
+      ip: 10.33.11.63
+      port-range-start: 9100      
+    host:
+      name: coe4
+      mac: 00:16:3e:65:be:43
+    type: [jboss, jon_agent]
+
+  - id: 5
+    name: prod05
+    jboss:
+      ip: 10.33.11.64
+      port-range-start: 9000      
+    host:
+      name: coe5
+      mac: 00:16:3e:65:be:44
+    type: [jboss, jon_agent]
+
+  - id: 6
+    name: prod06
+    jboss:
+      ip: 10.33.11.65
+      port-range-start: 9100      
+    host:
+      name: coe5
+      mac: 00:16:3e:65:be:44
+    type: [jboss, jon_agent]
+

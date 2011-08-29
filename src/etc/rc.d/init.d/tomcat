@@ -1,0 +1,30 @@
+#!/bin/sh
+
+###############################################################################
+#
+# tomcat
+# chkconfig: - 80 20
+# description: Manage local tomcat nodes
+#
+###############################################################################
+
+JBOSSH=/usr/sbin/jbossh
+
+case "$1" in
+  start)
+        $JBOSSH start --local --type tomcat
+        ;;
+  stop)
+        $JBOSSH shutdown --local --type tomcat
+        ;;
+  kill)
+        $JBOSSH destroy --local --type tomcat
+        ;;
+  status)
+        $JBOSSH list --local --type tomcat
+        ;;
+  *)
+        echo $"Usage: $0 {start|stop|kill|status}"
+        exit 1
+esac
+ 

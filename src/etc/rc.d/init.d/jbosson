@@ -1,0 +1,30 @@
+#!/bin/sh
+
+###############################################################################
+#
+# jbosson
+# chkconfig: - 80 20
+# description: Manage local jboss operations network nodes
+#
+###############################################################################
+
+JBOSSH=/usr/sbin/jbossh
+
+case "$1" in
+  start)
+        $JBOSSH start --local --type jon_agent,jon_server
+        ;;
+  stop)
+        $JBOSSH shutdown --local --type jon_agent,jon_server
+        ;;
+  kill)
+        $JBOSSH destroy --local --type jon_agent,jon_server
+        ;;
+  status)
+        $JBOSSH list --local --type jon_agent,jon_server
+        ;;
+  *)
+        echo $"Usage: $0 {start|stop|kill|status}"
+        exit 1
+esac
+ 

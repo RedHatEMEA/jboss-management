@@ -1,0 +1,108 @@
+##########################################################################
+#
+# JBoss Farm Configuration 
+#
+##########################################################################
+
+##########################################################################
+#
+# This is the default configuration file, describing the Farm configuration
+# domain model
+#
+# Craft your own based on this description and the examples bundled to
+# /tmp/jbossh-example-config 
+#
+##########################################################################
+
+---
+
+##########################################################################
+#
+# Node template
+#
+# This domain model describes the node defaults. Each field can be
+# overridden on a per node basis in the 'node_list' section below
+# 
+# The entire domain model is included here for completeness with 
+# descriptions for values
+#
+##########################################################################
+#node_template:
+#  id: [Integer: unique ID]
+#  name: [String: logical name]
+#  tomcat:
+#    product: [String: product identifier]
+#    module: [String: module selector under product path]
+#    version: [String: product and release version concatenation]
+#    ip: [IP: Bind IP address]
+#    port-range-start: [Port: base port from which range is begun]
+#    jre: [Path: path to JRE]
+#    deploy:
+#      type: [Enumeration: http_mvn|yum_rpm|svn_exploded|lfs_exploded|lfs_packed]
+#      uri: [URI: URI or local path of repository]
+#      resource:
+#        - product: [String: application group name]
+#          profile: [String: application selector name]
+#          module: [String: application module type]
+#          version: [String: application version number]
+#          deploy-dir: [Path: relative path to deploy directory]
+#  jboss:
+#    product: [String: product identifier]
+#    module: [String: module selector under product path]
+#    profile: [String: profile selector under module server path]
+#    version: [String: product and release version concatenation]
+#    user: [Principal: JMX admin user]
+#    password: [Password: JMX admin password]
+#    ip: [IP: Bind IP address]
+#    port-jndi: [Port: JNDI port, as set by hardcoded config, port-range-start variable or port-bindings-set]
+#    port-range-start: [Port: base port from which range is begun]
+#    port-bindings-set: [String: port service binding switch]
+#    partition: [String: cluster partition name]
+#    mcast-ip: [IP: cluster UDP multi-cast address]
+#    jre: [Path: path to JRE]
+#    deploy:
+#      type: [Enumeration: http_mvn|yum_rpm|svn_exploded|lfs_exploded|lfs_packed]
+#      uri: [URI: URI or local path of repository]
+#      resource:
+#        - product: [String: application group name]
+#          profile: [String: application selector name]
+#          module: [String: application module type]
+#          version: [String: application version number]
+#          deploy-dir: [Path: relative path to deploy directory]
+#  jon_agent:
+#    product: [String: product identifier] 
+#    version: [String: product and release version concatenation]
+#    jre: [Path: path to JRE]
+#  jon_server:
+#    product: [String: product identifier] 
+#    version: [String: product and release version concatenation]
+#    jre: [Path: path to JRE]
+#  repository:  
+#    type: [Enumeration: http_mvn|yum_rpm|svn_exploded|lfs_exploded|lfs_packed]
+#    uri: [URI: URI or local path of repository]
+#  host: 
+#    name: [HOST: resolvable host name]
+#    mac: [MAC: MAC address of host, used if provisioning a VM]
+#    user: [PRINCIPAL: OS user with shared key remote access]
+#    home: [PATH: directory to store installs under]
+#    netdev: [NETDEV: network device to multi-home]
+#    cpu: [INTEGER: number of CPUs to allocate, used if provisioning a VM]
+#    memory: [INTEGER: MB of memory to allocate, used if provisioning a VM]
+#    disk: [INTEGER: GB of disk to allocate, used if provisioning a VM]
+#    network: [NETDEV: network device to use, used if provisioning a VM]
+#    hypervisor: [HOST: hypervisor host name, used if provisioning a VM]
+#    image: [URI: URI or local path to OS image install]
+#    kickstart: [URI or local path to OS kickstart]
+#  type:
+#
+##########################################################################
+#
+# Node list
+#
+# This list defines each node and its unique attributes, overriding those
+# in the 'node_template' above
+#
+##########################################################################
+#node_list:
+#  - id: 0
+#    name: NODE01
